@@ -12,7 +12,10 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.const import (
     CONF_HOST,
     CONF_PORT
+
 )
+from homeassistant.helpers import event
+from homeassistant.core import Event
 from homeassistant.const import (
     EVENT_HOMEASSISTANT_START,
     EVENT_HOMEASSISTANT_STOP
@@ -22,11 +25,13 @@ _LOGGER = logging.getLogger(__name__)
 BUTTON_NAME = "button_name"
 BUTTON_ALT = "button_alt"
 REMOTE = "remote"
-FUTURE_EVENT_FIRE_TIMER = 0.5
+FUTURE_EVENT_FIRE_TIMER = 0.3
 
 DOMAIN = "lirc_socket"
 CONF_REMOTE = "remote"
 CONF_LONG_PRESS_THRESHOLD = "long_press_count"
+EVENT_IR_COMMAND_RECEIVED = "ir_command_received"
+EVENT_IR_INTERNAL_LONG_PRESS = "ir_internal_long_press"
 EVENT_IR_COMMAND_RECEIVED = "ir_command_received"
 
 ICON = "mdi:remote"
@@ -57,11 +62,48 @@ def setup(hass, config):
     except Exception as e:
         _LOGGER.error("except: %s", e)
         raise PlatformNotReady
+    finally:
+        sock.close()
     LircSocketInterface(hass, host, port, remote, long_press_threshold)
     return True
 
 
-class LircSocketInterface(threading.Thread):
+class LircSocketInterface():
+    def __init__(self, hass, host, port, remote_topic, long_press_threshold):
+        self.listener = LircSocketListener(
+            hass, host, port, remote_topic, long_press_threshold)
+        self.hass = hass
+        self._current_event = None
+        self._task_cancel = None
+        hass.bus.listen_once(
+            EVENT_HOMEASSISTANT_START, self.listener.start_listen)
+        hass.bus.listen_once(
+            EVENT_HOMEASSISTANT_STOP, self.listener.shutdown)
+        hass.bus.listen(
+            EVENT_IR_INTERNAL_LONG_PRESS, self.__long_press_handler)
+
+    def __gen_end_event(self, now=None):
+        evt = self._current_event
+        evt_data = evt.data
+        evt_data[BUTTON_ALT] = "end"
+        self.hass.bus.fire(EVENT_IR_COMMAND_RECEIVED, evt_data)
+
+    def __long_press_handler(self, evt: Event):
+        key_sym = evt.data.get(BUTTON_NAME)
+        remote = evt.data.get(REMOTE)
+        if (self._current_event is not None and
+            self._task_cancel is not None and
+            key_sym == self._current_event.data.get(BUTTON_NAME) and
+            remote == self._current_event.data.get(REMOTE)):
+            # cancel postponed task
+            self._task_cancel()
+        self._current_event = evt
+        self._task_cancel = event.async_call_later(
+            self.hass, FUTURE_EVENT_FIRE_TIMER,
+            self.__gen_end_event)
+
+
+class LircSocketListener(threading.Thread):
     """
     This interfaces with the lirc daemon to read IR commands.
 
@@ -80,11 +122,10 @@ class LircSocketInterface(threading.Thread):
         self._available = False
         self.remote = remote_topic
         self.long_press_threshold = long_press_threshold
-        self._future_event_thread = None
         self.hass = hass
-        hass.bus.listen_once(EVENT_HOMEASSISTANT_START, self.start_listen)
-        hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, self.shutdown)
+        self.sock = None
 
+    # deprecated
     def start_listen(self, event):
         """Start event-processing thread."""
         _LOGGER.debug("Event processing thread started")
@@ -93,7 +134,6 @@ class LircSocketInterface(threading.Thread):
     def shutdown(self, event):
         if self.sock:
             self.sock.close()
-        _LOGGER.debug("LIRC interface thread stopped")
 
     def __init_sock(self, host, port):
         if self._available:
@@ -124,7 +164,6 @@ class LircSocketInterface(threading.Thread):
 
     def run(self):
         """Run the loop of the LIRC interface thread."""
-        _LOGGER.info("LIRC interface thread started")
         self.__init_sock(self.host, self.port)
         while True:
             try:
@@ -156,17 +195,21 @@ class LircSocketInterface(threading.Thread):
                 continue
 
             cnt = int(cnt, 16)
-            button_alt = None
+            evt_data = {
+                BUTTON_NAME: key_sym,
+                BUTTON_ALT: None,
+                REMOTE: remote
+            }
             if cnt == 0:
-                button_alt = "short"
-            elif cnt > self.long_press_threshold:
-                button_alt = "long"
-            if button_alt is not None:
-                _LOGGER.debug("LIRC event fired")
+                evt_data[BUTTON_ALT] = "short"
+            elif cnt >= self.long_press_threshold:
+                evt_data[BUTTON_ALT] = "long"
                 self.hass.bus.fire(
-                    EVENT_IR_COMMAND_RECEIVED,
-                    {
-                        BUTTON_NAME: key_sym,
-                        BUTTON_ALT: button_alt,
-                        REMOTE: remote
-                    })
+                    EVENT_IR_INTERNAL_LONG_PRESS, evt_data)
+            button_alt = evt_data[BUTTON_ALT]
+            if button_alt is not None and \
+               (button_alt == "short" or
+                (button_alt == "long" and
+                 cnt == self.long_press_threshold)):
+                self.hass.bus.fire(
+                    EVENT_IR_COMMAND_RECEIVED, evt_data)

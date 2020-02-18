@@ -1,7 +1,7 @@
 {
   "domain": "lirc_socket",
   "name": "LircSocket",
-  "documentation": "https://www.home-assistant.io/integrations/lirc",
+  "documentation": "",
   "requirements": [],
   "dependencies": [],
   "codeowners": []
